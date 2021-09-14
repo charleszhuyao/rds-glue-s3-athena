@@ -1,0 +1,108 @@
+#import required modules
+import sys
+import json
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+# Use this code snippet in your app.
+# If you need more information about configurations or implementing the sample code, visit the AWS docs:   
+# https://aws.amazon.com/developers/getting-started/python/
+
+import boto3
+import base64
+from botocore.exceptions import ClientError
+
+
+def get_secret(secret_name,region_name):
+
+    # Create a Secrets Manager client
+    session = boto3.session.Session()
+    client = session.client(
+        service_name='secretsmanager',
+        region_name=region_name
+    )
+
+    # In this sample we only handle the specific exceptions for the 'GetSecretValue' API.
+    # See https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetSecretValue.html
+    # We rethrow the exception by default.
+
+    try:
+        get_secret_value_response = client.get_secret_value(
+            SecretId=secret_name
+        )
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'DecryptionFailureException':
+            # Secrets Manager can't decrypt the protected secret text using the provided KMS key.
+            # Deal with the exception here, and/or rethrow at your discretion.
+            raise e
+        elif e.response['Error']['Code'] == 'InternalServiceErrorException':
+            # An error occurred on the server side.
+            # Deal with the exception here, and/or rethrow at your discretion.
+            raise e
+        elif e.response['Error']['Code'] == 'InvalidParameterException':
+            # You provided an invalid value for a parameter.
+            # Deal with the exception here, and/or rethrow at your discretion.
+            raise e
+        elif e.response['Error']['Code'] == 'InvalidRequestException':
+            # You provided a parameter value that is not valid for the current state of the resource.
+            # Deal with the exception here, and/or rethrow at your discretion.
+            raise e
+        elif e.response['Error']['Code'] == 'ResourceNotFoundException':
+            # We can't find the resource that you asked for.
+            # Deal with the exception here, and/or rethrow at your discretion.
+            raise e
+    else:
+        # Decrypts secret using the associated KMS CMK.
+        # Depending on whether the secret is a string or binary, one of these fields will be populated.
+        if 'SecretString' in get_secret_value_response:
+            secret = get_secret_value_response['SecretString']
+            return(secret)
+        else:
+            decoded_binary_secret = base64.b64decode(get_secret_value_response['SecretBinary'])
+            return(decoded_binary_secret)
+            
+    # Your code goes here. 
+    
+## @params: [JOB_NAME]
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+#set variable to be used to connect the database
+database = "adventure_works"
+table = "Sales.SalesOrderHeader"
+secret=json.loads(get_secret('secretMSSQLMasterUser','cn-north-1'))
+print(secret)
+user = secret['username']
+password  = secret['password']
+
+#read table data into a spark dataframe
+jdbcDF = spark.read.format("jdbc") \
+    .option("url", f"jdbc:sqlserver://adventure.cxnfhux8ijdr.rds.cn-north-1.amazonaws.com.cn:1433;databaseName={database};") \
+    .option("dbtable", table) \
+    .option("user", user) \
+    .option("password", password) \
+    .option("driver", "com.microsoft.sqlserver.jdbc.SQLServerDriver") \
+    .load()
+jdbcDF.registerTempTable('oh')
+jdbcDF = glueContext.sql("""
+                                SELECT * 
+                                FROM oh
+                                WHERE orderdate<'2012-01-01'
+                                """)
+                                
+print("sparkdf Count: "+str(jdbcDF.count()))
+jdbcDF.show()
+
+#df.write.format('parquet').partitionBy("orderdate").save('s3://aws-glue-scripts-657975005475-cn-north-1/orderHeader-RDS/')
+
+df_source = DynamicFrame.fromDF(jdbcDF, glueContext, "df_source")
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = df_source, connection_type = "s3", connection_options = {"path": "s3://aws-glue-scripts-657975005475-cn-north-1/orderHeader/"}, format = "parquet", transformation_ctx = "datasink4")
+job.commit()
